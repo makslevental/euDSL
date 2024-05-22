@@ -1,0 +1,305 @@
+name: Distro
+
+on:
+  workflow_dispatch:
+    inputs:
+      DEBUG_ENABLED:
+        description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
+        type: boolean
+        required: false
+        default: false
+      DEBUG_OS:
+        description: 'which runner os to run the tmate action in (if the tmate action is run)'
+        type: string
+        default: 'windows-2019'
+        required: false
+      DEBUG_ARCH:
+        description: 'which runner arch to run the tmate action in (if the tmate action is run)'
+        type: string
+        default: 'x86_64'
+        required: false
+      DEBUG_DETACHED:
+        description: 'whether to launch tmate in detached mode (if the tmate action is run)'
+        type: boolean
+        required: false
+        default: true
+      LLVM_COMMIT:
+        description: 'llvm commit to build'
+        type: string
+        required: false
+        default: ''
+      # why are these strings and not type boolean?
+      # https://stackoverflow.com/a/76294014/9045206
+      APPLY_PATCHES:
+        description: 'whether to apply patches to source'
+        type: string
+        required: false
+        default: 'true'
+      RUN_TESTS:
+        description: 'whether to run llvm tests after build'
+        type: string
+        required: false
+        default: 'false'
+      DEBUG_CI_FAST_BUILD:
+        description: 'whether to build only one single llvm target (llvm-tblgen)'
+        type: string
+        required: false
+        default: 'false'
+
+  pull_request:
+  release:
+    types:
+      - published
+
+#  schedule:
+#    # At minute 0 past hour 1. (see https://crontab.guru)
+#    - cron: '00 01 * * *'
+
+jobs:
+
+  get_llvm_project_commit:
+
+    name: Get latest LLVM commit
+
+    runs-on: ubuntu-latest
+
+    outputs:
+      LLVM_PROJECT_COMMIT: ${{ steps.get_llvm_project_commit.outputs.LLVM_PROJECT_COMMIT }}
+      DATETIME: ${{ steps.get_llvm_project_commit.outputs.DATETIME }}
+
+    steps:
+      - name: Get llvm-project commit
+        id: get_llvm_project_commit
+        run: |
+          
+          if [ x"${{ inputs.LLVM_COMMIT }}" == x"" ]; then
+            sudo apt install jq
+            LLVM_PROJECT_COMMIT=$(curl -s https://api.github.com/repos/llvm/llvm-project/commits/main | jq -r '.sha[:8]')
+          else
+            LLVM_PROJECT_COMMIT="${{ inputs.llvm_commit }}"
+          fi
+          echo "LLVM_PROJECT_COMMIT=${LLVM_PROJECT_COMMIT}" | tee -a $GITHUB_OUTPUT
+          DATETIME=$(date +"%Y%m%d%H")
+          echo "DATETIME=${DATETIME}" | tee -a $GITHUB_OUTPUT
+          
+  settings:
+    
+    runs-on: ubuntu-latest
+    
+    needs: get_llvm_project_commit
+    
+    steps:
+      
+      - name: Set commons as env vars
+        id: settings
+        run: |
+          
+          APPLY_PATCHES="true"
+          if [ x"${{ inputs.APPLY_PATCHES }}" == x"false" ]; then
+            APPLY_PATCHES="false"
+          fi 
+          DEBUG_CI_FAST_BUILD="false"
+          if [ x"${{ inputs.DEBUG_CI_FAST_BUILD }}" == x"true" ]; then
+            DEBUG_CI_FAST_BUILD="true"
+          fi
+          RUN_TESTS="false"
+          if [ x"${{ inputs.RUN_TESTS }}" == x"true" ]; then
+            RUN_TESTS="true"
+          fi
+          
+          UPLOAD_ARTIFACTS="true"
+          if [ x"${{ github.event.schedule }}" == x"0 */4 * * *" ] || [ x"$DEBUG_CI_FAST_BUILD" == x"true" ]; then
+            UPLOAD_ARTIFACTS="false"
+          fi 
+          
+          echo "APPLY_PATCHES=$APPLY_PATCHES" | tee -a $GITHUB_OUTPUT
+          echo "DEBUG_CI_FAST_BUILD=$DEBUG_CI_FAST_BUILD" | tee -a $GITHUB_OUTPUT
+          echo "RUN_TESTS=$RUN_TESTS" | tee -a $GITHUB_OUTPUT
+          echo "UPLOAD_ARTIFACTS=$UPLOAD_ARTIFACTS" | tee -a $GITHUB_OUTPUT
+          
+    outputs:
+      APPLY_PATCHES: ${{ steps.settings.outputs.APPLY_PATCHES }}
+      DEBUG_CI_FAST_BUILD: ${{ steps.settings.outputs.DEBUG_CI_FAST_BUILD }}
+      RUN_TESTS: ${{ steps.settings.outputs.RUN_TESTS }}
+      UPLOAD_ARTIFACTS: ${{ steps.settings.outputs.UPLOAD_ARTIFACTS }}
+      LLVM_PROJECT_COMMIT: ${{ needs.get_llvm_project_commit.outputs.LLVM_PROJECT_COMMIT }}
+      DATETIME: ${{ needs.get_llvm_project_commit.outputs.DATETIME }}
+
+  build:
+
+    needs: settings
+
+    name: ${{ matrix.OS }} ${{ matrix.ARCH }} ${{ matrix.BUILD_CUDA && 'cuda' || '' }} ${{ matrix.BUILD_VULKAN && 'vulkan' || '' }} ${{ matrix.BUILD_OPENMP && 'openmp' || '' }}
+
+    continue-on-error: true
+
+    runs-on: ${{ matrix.OS }}
+
+    outputs:
+      MLIR_WHEEL_VERSION: ${{ steps.get_wheel_version.outputs.MLIR_WHEEL_VERSION }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - OS: ubuntu-20.04
+            ARCH: x86_64
+
+#          - OS: ubuntu-20.04
+#            ARCH: aarch64
+#
+#          - OS: ubuntu-20.04
+#            ARCH: x86_64
+#            BUILD_CUDA: true
+#
+#          - OS: ubuntu-20.04
+#            ARCH: x86_64
+#            BUILD_VULKAN: true
+#
+#          - OS: ubuntu-20.04
+#            ARCH: x86_64
+#            BUILD_OPENMP: true
+#
+#          - OS: windows-2019
+#            ARCH: AMD64
+#
+#          - OS: macos-12
+#            ARCH: x86_64
+#
+#          - OS: macos-12
+#            ARCH: arm64
+#
+#          - OS: macos-12
+#            ARCH: arm64
+#            BUILD_VULKAN: true
+#
+#          - OS: macos-12
+#            ARCH: arm64
+#            BUILD_OPENMP: true
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+
+    - name: Set env variables
+      working-directory: ${{ steps.setup_base.outputs.WORKSPACE_ROOT }}
+      run: |
+        
+        echo "DATETIME=${{ needs.settings.outputs.DATETIME }}" >> $GITHUB_ENV
+        echo "LLVM_PROJECT_COMMIT=${{ needs.settings.outputs.LLVM_PROJECT_COMMIT }}" >> $GITHUB_ENV
+        echo "MATRIX_OS=${{ matrix.OS }}" >> $GITHUB_ENV
+
+    - name: set ENV macos
+      if: contains(matrix.OS, 'macos')
+      shell: bash
+      run: |
+        
+        echo "MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion)" | tee -a $GITHUB_ENV
+
+    - name: Checkout actions
+      uses: actions/checkout@v3
+
+    - uses: makslevental/mlir-wheels/actions/setup_base@d77bf5dc69c46a8c2738b44528749768888eb361
+      id: setup_base
+      with:
+        # optional
+        DEBUG_ENABLED: ${{ inputs.DEBUG_ENABLED }}
+        DEBUG_OS: ${{ inputs.DEBUG_OS }}
+        DEBUG_ARCH: ${{ inputs.DEBUG_ARCH }}
+        DEBUG_DETACHED: ${{ inputs.DEBUG_DETACHED }}
+        # required
+        MATRIX_OS: ${{ matrix.OS }}
+        MATRIX_ARCH: ${{ matrix.ARCH }}
+
+    - name: Setup Cpp
+      uses: aminya/setup-cpp@v1
+      with:
+        compiler: llvm-14
+
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install python deps
+      run: |
+        
+        pip install -r requirements-dev.txt
+
+      # This step is needed because action/checkout does not support paths.
+      # don't move because you can't parameterize -uses: ./actions/setup_ccache with workspace_root
+    - name: Copy stuff to workspace_root
+      run: |
+        
+        WORKSPACE_ROOT="${{ steps.setup_base.outputs.WORKSPACE_ROOT }}"
+        if [[ "${{ matrix.OS }}" == *"windows"* ]]; then
+          WORKSPACE_ROOT=$(echo "/$WORKSPACE_ROOT" | sed -e 's/\\/\//g' -e 's/://')
+        fi
+        ls -lah
+        
+        if [[ x"$PWD" != x"$WORKSPACE_ROOT" ]]; then
+          shopt -s dotglob
+          cp -r ./* "$WORKSPACE_ROOT"
+        fi
+        ls -lah "$WORKSPACE_ROOT"
+
+    # setup llvm
+
+    - name: Get LLVM
+      working-directory: ${{ steps.setup_base.outputs.WORKSPACE_ROOT }}
+      run: |
+        
+        curl -s https://codeload.github.com/llvm/llvm-project/zip/${{ needs.settings.outputs.LLVM_PROJECT_COMMIT }} -o llvm.zip
+        unzip -q llvm.zip
+        rm -rf llvm.zip
+        LLVM_PROJECT_COMMIT=${{ needs.settings.outputs.LLVM_PROJECT_COMMIT }}
+        mv llvm-project-$LLVM_PROJECT_COMMIT llvm-project
+
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
+    - name: Get/Install gllvm
+      working-directory: ${{ steps.setup_base.outputs.WORKSPACE_ROOT }}
+      run: |
+
+        go install github.com/SRI-CSL/gllvm/cmd/...@latest
+
+# build
+
+    - name: Build LLVM
+      working-directory: ${{ steps.setup_base.outputs.WORKSPACE_ROOT }}
+      run: |
+        
+        export CC=gclang >> $GITHUB_ENV
+        export CXX=gclang++ >> $GITHUB_ENV
+        export LLVM_CC_NAME=clang-14 >> $GITHUB_ENV
+        export LLVM_CXX_NAME=clang++-14 >> $GITHUB_ENV
+        export LLVM_LINK_NAME=llvm-link-14 >> $GITHUB_ENV
+        export LLVM_AR_NAME=llvm-ar-14 >> $GITHUB_ENV
+        
+        cmake -DCMAKE_BUILD_TYPE=Release \
+          -G "Unix Makefiles" \
+          -DPython3_EXECUTABLE="$(which python)" \
+          -DLLVM_ENABLE_PROJECTS=mlir \
+          -DLLVM_TARGETS_TO_BUILD=X86 \
+          -DMLIR_BUILD_MLIR_C_DYLIB=ON \
+          -DMLIR_BUILD_MLIR_C_DYLIB=ON \
+          -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
+          -S llvm-project/llvm \
+          -B build_llvm
+        
+        cmake --build build_llvm --target mlir-opt -- -j 2
+
+    - name: Extract bc
+      working-directory: ${{ steps.setup_base.outputs.WORKSPACE_ROOT }}
+      run: |
+        
+        get-bc -o mlir.bc -l $(which llvm-link-14) -b build_llvm/bin/mlir-opt
+
+    - name: Test bc
+      working-directory: ${{ steps.setup_base.outputs.WORKSPACE_ROOT }}
+      run: |
+        
+        python llvmir_iter.py
